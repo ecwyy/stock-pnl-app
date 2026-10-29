@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import date
 from typing import Any
 
@@ -42,6 +46,104 @@ def detect_currency(ticker: str, info: dict | None = None) -> str:
     return "USD"
 
 
+def _price_from_yahoo_chart(ticker: str) -> tuple[float | None, str | None]:
+    """直接打 Yahoo chart API 取最新價（yfinance 被限流時的備援）。"""
+    encoded = urllib.parse.quote(ticker, safe=".")
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}"
+        f"?interval=1d&range=5d"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; stock-pnl-app/1.0)"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode())
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return None, None
+
+    results = (payload.get("chart") or {}).get("result") or []
+    if not results:
+        return None, None
+
+    meta = results[0].get("meta") or {}
+    price = meta.get("regularMarketPrice")
+    if price is None:
+        price = meta.get("fulldayPrice") or meta.get("chartPreviousClose")
+    if price is None:
+        quotes = (results[0].get("indicators") or {}).get("quote") or []
+        closes = (quotes[0].get("close") if quotes else None) or []
+        closes = [c for c in closes if c is not None]
+        if closes:
+            price = closes[-1]
+
+    currency = meta.get("currency")
+    try:
+        return (float(price) if price is not None else None), (
+            str(currency).upper() if currency else None
+        )
+    except (TypeError, ValueError):
+        return None, None
+
+
+def _price_from_fast_info(ticker_obj: Any) -> tuple[float | None, str | None]:
+    try:
+        fi = getattr(ticker_obj, "fast_info", None)
+        if fi is None:
+            return None, None
+        price = None
+        currency = None
+        try:
+            price = fi.get("lastPrice") or fi.get("last_price")
+        except Exception:
+            price = getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None)
+        try:
+            currency = fi.get("currency")
+        except Exception:
+            currency = getattr(fi, "currency", None)
+        price_f = float(price) if price else None
+        if price_f is not None and price_f <= 0:
+            price_f = None
+        return price_f, (str(currency).upper() if currency else None)
+    except Exception:
+        return None, None
+
+
+def _price_from_info(ticker_obj: Any) -> tuple[float | None, str | None, dict]:
+    info: dict = {}
+    try:
+        info = ticker_obj.info or {}
+    except Exception:
+        return None, None, {}
+    price = None
+    for key in ("currentPrice", "regularMarketPrice", "previousClose", "navPrice"):
+        v = info.get(key)
+        if v is not None:
+            try:
+                price = float(v)
+                if price > 0:
+                    break
+            except (TypeError, ValueError):
+                price = None
+            else:
+                if price and price > 0:
+                    break
+                price = None
+    currency = info.get("currency")
+    return price, (str(currency).upper() if currency else None), info
+
+
+def _price_from_history(ticker_obj: Any) -> float | None:
+    try:
+        hist = ticker_obj.history(period="5d")
+        if hist is not None and not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except Exception:
+        pass
+    return None
+
+
 def fetch_lot_data(
     ticker: str,
     buy_date: date,
@@ -55,42 +157,31 @@ def fetch_lot_data(
     currency = detect_currency(ticker)
     info: dict = {}
 
-    try:
-        fi = getattr(t, "fast_info", None)
-        if fi is not None:
-            try:
-                current_price = float(fi.get("lastPrice") or fi.get("last_price") or 0) or None
-            except Exception:
-                pass
-            try:
-                c = fi.get("currency")
-                if c:
-                    currency = str(c).upper()
-            except Exception:
-                pass
-    except Exception:
-        pass
+    price, cur = _price_from_fast_info(t)
+    if price is not None:
+        current_price = price
+    if cur:
+        currency = cur
 
     if current_price is None:
-        try:
-            info = t.info or {}
-            for key in ("currentPrice", "regularMarketPrice", "previousClose", "navPrice"):
-                v = info.get(key)
-                if v is not None:
-                    current_price = float(v)
-                    break
-            if info.get("currency"):
-                currency = str(info["currency"]).upper()
-        except Exception:
-            info = {}
+        price, cur, info = _price_from_info(t)
+        if price is not None:
+            current_price = price
+        if cur:
+            currency = cur
 
     if current_price is None:
-        try:
-            hist = t.history(period="5d")
-            if hist is not None and not hist.empty:
-                current_price = float(hist["Close"].iloc[-1])
-        except Exception:
-            pass
+        price = _price_from_history(t)
+        if price is not None and price > 0:
+            current_price = price
+
+    # yfinance 常因 Yahoo 限流／crumb 失敗；chart API 較穩
+    if current_price is None or current_price <= 0:
+        price, cur = _price_from_yahoo_chart(ticker)
+        if price is not None and price > 0:
+            current_price = price
+        if cur:
+            currency = cur
 
     if current_price is None or current_price <= 0:
         raise ValueError(f"無法取得「{ticker}」的最新價格，請檢查代號是否正確。")
