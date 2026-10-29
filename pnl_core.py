@@ -16,8 +16,8 @@ import yfinance as yf
 def normalize_ticker(raw: str) -> str:
     """將用戶輸入正規化為 yfinance ticker。
 
-    美股：AAPL、MSFT → 原樣大寫
-    港股：0700、700、0700.HK、9988.HK → XXXX.HK（四位補零）
+    美股：AAPL、MSFT、O、JAAA → 原樣大寫
+    港股：0700、700、823、0700.HK、9988.HK → XXXX.HK（四位補零）
     """
     s = (raw or "").strip().upper()
     if not s:
@@ -46,23 +46,7 @@ def detect_currency(ticker: str, info: dict | None = None) -> str:
     return "USD"
 
 
-def _price_from_yahoo_chart(ticker: str) -> tuple[float | None, str | None]:
-    """直接打 Yahoo chart API 取最新價（yfinance 被限流時的備援）。"""
-    encoded = urllib.parse.quote(ticker, safe=".")
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}"
-        f"?interval=1d&range=5d"
-    )
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; stock-pnl-app/1.0)"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            payload = json.loads(resp.read().decode())
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        return None, None
-
+def _parse_chart_payload(payload: dict) -> tuple[float | None, str | None]:
     results = (payload.get("chart") or {}).get("result") or []
     if not results:
         return None, None
@@ -80,11 +64,76 @@ def _price_from_yahoo_chart(ticker: str) -> tuple[float | None, str | None]:
 
     currency = meta.get("currency")
     try:
-        return (float(price) if price is not None else None), (
-            str(currency).upper() if currency else None
-        )
+        price_f = float(price) if price is not None else None
     except (TypeError, ValueError):
         return None, None
+    if price_f is None or price_f <= 0:
+        return None, None
+    return price_f, (str(currency).upper() if currency else None)
+
+
+def _chart_urls(ticker: str) -> list[str]:
+    encoded = urllib.parse.quote(ticker, safe=".")
+    return [
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?interval=1d&range=5d",
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{encoded}?interval=1d&range=5d",
+    ]
+
+
+_CHART_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+}
+
+
+def _price_from_yahoo_chart(ticker: str) -> tuple[float | None, str | None]:
+    """直接打 Yahoo chart API 取最新價（優先於 yfinance，Cloud 較穩）。"""
+    urls = _chart_urls(ticker)
+
+    # curl_cffi 模擬瀏覽器 TLS，對資料中心 IP（例如 Streamlit Cloud）較不易被擋
+    try:
+        from curl_cffi import requests as creq
+
+        for url in urls:
+            try:
+                resp = creq.get(
+                    url,
+                    headers=_CHART_HEADERS,
+                    impersonate="chrome",
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    continue
+                price, cur = _parse_chart_payload(resp.json())
+                if price is not None:
+                    return price, cur
+            except Exception:
+                continue
+    except ImportError:
+        pass
+
+    for url in urls:
+        req = urllib.request.Request(url, headers=_CHART_HEADERS)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                payload = json.loads(resp.read().decode())
+        except (
+            urllib.error.HTTPError,
+            urllib.error.URLError,
+            TimeoutError,
+            json.JSONDecodeError,
+            OSError,
+        ):
+            continue
+        price, cur = _parse_chart_payload(payload)
+        if price is not None:
+            return price, cur
+
+    return None, None
 
 
 def _price_from_fast_info(ticker_obj: Any) -> tuple[float | None, str | None]:
@@ -102,7 +151,10 @@ def _price_from_fast_info(ticker_obj: Any) -> tuple[float | None, str | None]:
             currency = fi.get("currency")
         except Exception:
             currency = getattr(fi, "currency", None)
-        price_f = float(price) if price else None
+        try:
+            price_f = float(price) if price is not None else None
+        except (TypeError, ValueError):
+            price_f = None
         if price_f is not None and price_f <= 0:
             price_f = None
         return price_f, (str(currency).upper() if currency else None)
@@ -151,17 +203,25 @@ def fetch_lot_data(
     quantity: float,
 ) -> dict[str, Any]:
     """取得單一持倉的現價、股息與盈虧。"""
-    t = yf.Ticker(ticker)
-
     current_price: float | None = None
     currency = detect_currency(ticker)
     info: dict = {}
 
-    price, cur = _price_from_fast_info(t)
-    if price is not None:
+    # 先打 Yahoo chart（無需 crumb；Streamlit Cloud 上比 yfinance 穩）
+    price, cur = _price_from_yahoo_chart(ticker)
+    if price is not None and price > 0:
         current_price = price
     if cur:
         currency = cur
+
+    t = yf.Ticker(ticker)
+
+    if current_price is None:
+        price, cur = _price_from_fast_info(t)
+        if price is not None:
+            current_price = price
+        if cur:
+            currency = cur
 
     if current_price is None:
         price, cur, info = _price_from_info(t)
@@ -175,8 +235,8 @@ def fetch_lot_data(
         if price is not None and price > 0:
             current_price = price
 
-    # yfinance 常因 Yahoo 限流／crumb 失敗；chart API 較穩
     if current_price is None or current_price <= 0:
+        # 再試一次 chart（偶發限流）
         price, cur = _price_from_yahoo_chart(ticker)
         if price is not None and price > 0:
             current_price = price
