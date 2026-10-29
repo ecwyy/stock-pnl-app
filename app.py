@@ -46,15 +46,44 @@ with st.expander("使用說明", expanded=True):
         """
     )
 
+DEFAULT_LOTS = [
+    {
+        "buy_date": date(2026, 4, 15),
+        "ticker": "03466",
+        "buy_price": 21.18,
+        "quantity": 4000.0,
+    },
+    {
+        "buy_date": date(2026, 4, 16),
+        "ticker": "00823",
+        "buy_price": 38.22,
+        "quantity": 3000.0,
+    },
+    {
+        "buy_date": date(2026, 4, 24),
+        "ticker": "O",
+        "buy_price": 64.06,
+        "quantity": 300.0,
+    },
+    {
+        "buy_date": date(2026, 4, 16),
+        "ticker": "JAAA",
+        "buy_price": 50.63,
+        "quantity": 212.0,
+    },
+]
+
+
+def _copy_lots(lots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(lot) for lot in lots]
+
+
 if "lots" not in st.session_state:
-    st.session_state.lots = [
-        {
-            "buy_date": date(2024, 1, 2),
-            "ticker": "AAPL",
-            "buy_price": 185.0,
-            "quantity": 10.0,
-        }
-    ]
+    st.session_state.lots = _copy_lots(DEFAULT_LOTS)
+# Bumped on reset so input widgets are recreated from DEFAULT_LOTS.
+# Reusing the same widget keys would keep the previous typed values.
+if "lots_version" not in st.session_state:
+    st.session_state.lots_version = 0
 
 st.subheader("持倉輸入")
 
@@ -72,17 +101,12 @@ with col_btn1:
         st.rerun()
 with col_btn2:
     if st.button("🗑️ 清空重設", use_container_width=True):
-        st.session_state.lots = [
-            {
-                "buy_date": date.today(),
-                "ticker": "",
-                "buy_price": 0.0,
-                "quantity": 0.0,
-            }
-        ]
+        st.session_state.lots = _copy_lots(DEFAULT_LOTS)
+        st.session_state.lots_version += 1
         st.rerun()
 
 lots_to_remove: list[int] = []
+_lots_version = st.session_state.lots_version
 for i, lot in enumerate(st.session_state.lots):
     st.markdown(f"**第 {i + 1} 筆**")
     c1, c2, c3, c4, c5 = st.columns([1.4, 1.2, 1.2, 1.2, 0.5])
@@ -91,14 +115,14 @@ for i, lot in enumerate(st.session_state.lots):
             "購入日期",
             value=lot["buy_date"],
             max_value=date.today(),
-            key=f"buy_date_{i}",
+            key=f"buy_date_{_lots_version}_{i}",
         )
     with c2:
         lot["ticker"] = st.text_input(
             "股票代號",
             value=lot["ticker"],
             placeholder="AAPL 或 0700",
-            key=f"ticker_{i}",
+            key=f"ticker_{_lots_version}_{i}",
         )
     with c3:
         lot["buy_price"] = st.number_input(
@@ -107,7 +131,7 @@ for i, lot in enumerate(st.session_state.lots):
             value=float(lot["buy_price"] or 0),
             step=0.01,
             format="%.4f",
-            key=f"buy_price_{i}",
+            key=f"buy_price_{_lots_version}_{i}",
         )
     with c4:
         lot["quantity"] = st.number_input(
@@ -116,12 +140,12 @@ for i, lot in enumerate(st.session_state.lots):
             value=float(lot["quantity"] or 0),
             step=1.0,
             format="%.4f",
-            key=f"qty_{i}",
+            key=f"qty_{_lots_version}_{i}",
         )
     with c5:
         st.write("")
         st.write("")
-        if st.button("刪除", key=f"del_{i}", use_container_width=True):
+        if st.button("刪除", key=f"del_{_lots_version}_{i}", use_container_width=True):
             lots_to_remove.append(i)
 
 if lots_to_remove:
