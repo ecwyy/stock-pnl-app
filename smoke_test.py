@@ -29,6 +29,8 @@ def main() -> None:
 
     check("美股 AAPL", "AAPL", date(2023, 1, 3), 130.0, 10)
     check("港股 騰訊", "0700", date(2023, 1, 3), 350.0, 100)
+    check("港股 ETF 3466", "3466", date(2025, 5, 1), 18.0, 400)
+    assert normalize_ticker("3466") == "3466.HK"
     print("\n煙霧測試完成。")
 
 
